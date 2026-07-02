@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -68,6 +69,65 @@ def default_state() -> dict[str, Any]:
     }
 
 
+def normalize_cli_command(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        return shlex.split(text)[0]
+    except ValueError:
+        parts = text.split()
+        return parts[0] if parts else ""
+
+
+def discover_codex_path(configured_value: str = "") -> str:
+    normalized = normalize_cli_command(configured_value)
+    candidate_names = [normalized, "codex"]
+    candidate_names = [candidate for candidate in candidate_names if candidate]
+    for candidate in candidate_names:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
+            return str(candidate_path)
+    fallback_paths = [
+        Path("/Users/mac/.vscode/extensions/openai.chatgpt-26.623.42026-darwin-arm64/bin/macos-aarch64/codex"),
+        Path.home() / ".vscode/extensions/openai.chatgpt-26.623.42026-darwin-arm64/bin/macos-aarch64/codex",
+    ]
+    fallback_paths.extend(
+        sorted(
+            Path.home().glob(".vscode/extensions/openai.chatgpt-*/bin/macos-aarch64/codex"),
+            reverse=True,
+        )
+    )
+    for fallback in fallback_paths:
+        if fallback.is_file() and os.access(fallback, os.X_OK):
+            return str(fallback)
+    return normalized
+
+
+def discover_gemini_path(configured_value: str = "") -> str:
+    normalized = normalize_cli_command(configured_value)
+    candidate_names = [normalized, "gemini"]
+    candidate_names = [candidate for candidate in candidate_names if candidate]
+    for candidate in candidate_names:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
+            return str(candidate_path)
+    fallback_paths = [
+        Path("/opt/homebrew/bin/gemini"),
+        Path.home() / ".npm-global/bin/gemini",
+    ]
+    for fallback in fallback_paths:
+        if fallback.is_file() and os.access(fallback, os.X_OK):
+            return str(fallback)
+    return normalized
+
+
 @dataclass
 class AutomationConfig:
     project_path: str = "/Users/mac/Desktop/waansaung/delivery-app-backend"
@@ -102,12 +162,19 @@ class AutomationConfig:
     stop_hotkey: str = "control+option+s"
     provider: str = "codex"
     gemini_path: str = "gemini"
+    gemini_model: str = "gemini-3.5-flash"
     auto_switch_to_gemini_on_codex_limit: bool = True
     codex_prompt_prefix: str = (
-        "Review these Lark messages and implement or fix only the backend APIs "
-        "or logic requested. Keep the change scoped and run relevant checks. "
+        "Review these Lark messages and do only the backend/API/logic work requested. "
+        "Keep the change scoped and run relevant checks. "
         "If you make changes, prepare them clearly for git commit/push. "
-        "Write the final result summary in Myanmar language."
+        "Write the final result in concise Myanmar language using a Codex-UI style answer. "
+        "Rules for the final answer: "
+        "start with the direct answer first; "
+        "use short sections only when needed such as 'Code အရ:' and 'ဆိုလိုတာက:'; "
+        "keep identifiers like table names, fields, routes, and files in backticks; "
+        "use flat bullet points; "
+        "do not include logs, timestamps, tokens used, internal notes, or repeated text."
     )
     commit_message: str = "auto(backend): implement from lark trigger"
     codex_path: str = "codex"
@@ -170,6 +237,8 @@ class AutomationState:
 def load_config() -> AutomationConfig:
     if not CONFIG_PATH.exists():
         config = AutomationConfig()
+        config.codex_path = discover_codex_path(config.codex_path) or "codex"
+        config.gemini_path = discover_gemini_path(config.gemini_path) or "gemini"
         save_config(config)
         return config
 
@@ -185,7 +254,10 @@ def load_config() -> AutomationConfig:
         raw["target_chats"] = [raw["dm_target_id"]]
     defaults = asdict(AutomationConfig())
     defaults.update(raw)
-    return AutomationConfig(**defaults)
+    config = AutomationConfig(**defaults)
+    config.codex_path = discover_codex_path(config.codex_path) or "codex"
+    config.gemini_path = discover_gemini_path(config.gemini_path) or "gemini"
+    return config
 
 
 def save_config(config: AutomationConfig) -> None:
@@ -595,17 +667,20 @@ class LarkAutomation:
             self.logs.add("Evening report skipped because stop was requested.", "warn")
             return
         prompt = (
-            "Generate today's work report in this exact format and level of detail:\n"
+            "Generate today's work report in a Codex UI style format:\n"
             "Today Tasks\n"
-            "[concise task area title]\n"
-            "[detailed paragraph or bullets for the first workstream]\n"
-            "[repeat title + detail blocks if there are multiple workstreams]\n"
+            "[task area title]\n"
+            "- [clear completed point]\n"
+            "- [clear completed point]\n"
+            "[repeat title + bullet blocks if there are multiple workstreams]\n"
             "\n"
             "2. Short Version\n"
-            "[short condensed summary of the same completed work]\n"
+            "- [short condensed point]\n"
+            "- [short condensed point]\n"
             "\n"
             "3. Client Update Format\n"
-            "[client-friendly update summary in simpler wording]\n"
+            "- [client-friendly point in simpler wording]\n"
+            "- [client-friendly point in simpler wording]\n"
             "\n"
             "Rules:\n"
             "- Return plain text only.\n"
@@ -613,6 +688,7 @@ class LarkAutomation:
             "- Do not include tokens used, logs, timestamps, or internal notes.\n"
             "- Do not duplicate the same points twice.\n"
             "- Do not add suggestions or next steps unless they are necessary deployment notes.\n"
+            "- Keep the wording concise and concrete like Codex UI summaries.\n"
             "- Start directly with 'Today Tasks'."
         )
         if self.config.dry_run:
@@ -1275,44 +1351,10 @@ class LarkAutomation:
         return cleaned or summary.strip()
 
     def resolve_codex_path(self) -> str:
-        candidate_names = [self.config.codex_path.strip(), "codex"]
-        candidate_names = [candidate for candidate in candidate_names if candidate]
-
-        for candidate in candidate_names:
-            resolved = shutil.which(candidate)
-            if resolved:
-                return resolved
-            candidate_path = Path(candidate).expanduser()
-            if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
-                return str(candidate_path)
-
-        fallback_paths = [
-            Path("/Users/mac/.vscode/extensions/openai.chatgpt-26.623.42026-darwin-arm64/bin/macos-aarch64/codex"),
-            Path.home() / ".vscode/extensions/openai.chatgpt-26.623.42026-darwin-arm64/bin/macos-aarch64/codex",
-        ]
-        for fallback in fallback_paths:
-            if fallback.is_file() and os.access(fallback, os.X_OK):
-                return str(fallback)
-        return ""
+        return discover_codex_path(self.config.codex_path)
 
     def resolve_gemini_path(self) -> str:
-        candidate_names = [self.config.gemini_path.strip(), "gemini"]
-        candidate_names = [candidate for candidate in candidate_names if candidate]
-        for candidate in candidate_names:
-            resolved = shutil.which(candidate)
-            if resolved:
-                return resolved
-            candidate_path = Path(candidate).expanduser()
-            if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
-                return str(candidate_path)
-        fallback_paths = [
-            Path("/opt/homebrew/bin/gemini"),
-            Path.home() / ".npm-global/bin/gemini",
-        ]
-        for fallback in fallback_paths:
-            if fallback.is_file() and os.access(fallback, os.X_OK):
-                return str(fallback)
-        return ""
+        return discover_gemini_path(self.config.gemini_path)
 
     def execute_codex_and_maybe_push(self, tasks_text: str) -> None:
         project_path = Path(self.config.project_path).expanduser()
@@ -1382,6 +1424,15 @@ class LarkAutomation:
                 completed, _, status = self.run_gemini_prompt(prompt, cwd=str(project_path))
             else:
                 _ = output
+
+        if (
+            provider != "gemini"
+            and self.config.auto_switch_to_gemini_on_codex_limit
+            and status != "usage_limit"
+        ):
+            final_summary = str(self.state.snapshot().get("codex_result_summary") or "").strip()
+            if final_summary:
+                self.send_codex_result_summary(final_summary)
 
         if self.config.auto_push and completed:
             self.commit_and_push(str(project_path))
@@ -1587,6 +1638,7 @@ class LarkAutomation:
     def run_gemini_prompt(self, prompt: str, cwd: str, post_summary: bool = True) -> tuple[bool, str, str]:
         gemini_executable = self.config.gemini_path
         gemini_path = self.resolve_gemini_path()
+        gemini_model = (self.config.gemini_model or "").strip()
         if not gemini_path:
             summary = "Gemini CLI command မတွေ့လို့ fallback run မလုပ်နိုင်ပါ။"
             self.logs.add("Gemini CLI was not found on PATH.", "error")
@@ -1613,15 +1665,21 @@ class LarkAutomation:
                 "codex_last_finished_at": None,
                 "codex_result_summary": None,
                 "codex_output": [
-                    "$ " + " ".join([gemini_path, "-p", "<prompt>", "--yolo", "--output-format", "text"]),
+                    "$ " + " ".join(
+                        [part for part in [gemini_path, "-m", gemini_model, "-p", "<prompt>", "--yolo", "--output-format", "text"] if part]
+                    ),
                     "\n[PROMPT]",
                     prompt,
                 ],
             }
         )
-        completed = subprocess.run(
+        command = [
+            gemini_path,
+        ]
+        if gemini_model:
+            command.extend(["-m", gemini_model])
+        command.extend(
             [
-                gemini_path,
                 "-p",
                 prompt,
                 "--yolo",
@@ -1630,7 +1688,10 @@ class LarkAutomation:
                 "--include-directories",
                 cwd,
                 "--skip-trust",
-            ],
+            ]
+        )
+        completed = subprocess.run(
+            command,
             cwd=cwd,
             check=False,
             capture_output=True,
@@ -2389,6 +2450,10 @@ HTML = r"""<!doctype html>
               <label for="geminiPath">Gemini path or command</label>
               <input id="geminiPath" placeholder="gemini">
             </div>
+            <div class="field">
+              <label for="geminiModel">Gemini model</label>
+              <input id="geminiModel" placeholder="gemini-3.5-flash">
+            </div>
             <div class="field wide">
               <label for="stopHotkey">Stop hotkey</label>
               <input id="stopHotkey" placeholder="control+option+s">
@@ -2499,6 +2564,7 @@ HTML = r"""<!doctype html>
       $("codexPath").value = config.codex_path;
       $("provider").value = config.provider || "codex";
       $("geminiPath").value = config.gemini_path || "gemini";
+      $("geminiModel").value = config.gemini_model || "gemini-3.5-flash";
       $("stopHotkey").value = config.stop_hotkey;
       $("appId").value = config.lark_app_id;
       $("appSecret").value = config.lark_app_secret;
@@ -2545,6 +2611,7 @@ HTML = r"""<!doctype html>
         codex_path: $("codexPath").value.trim() || "codex",
         provider: $("provider").value.trim() || "codex",
         gemini_path: $("geminiPath").value.trim() || "gemini",
+        gemini_model: $("geminiModel").value.trim() || "gemini-3.5-flash",
         stop_hotkey: $("stopHotkey").value.trim() || "control+option+s",
         lark_app_id: $("appId").value.trim(),
         lark_app_secret: $("appSecret").value,
@@ -2814,10 +2881,8 @@ class AppHandler(BaseHTTPRequestHandler):
         config.provider = (config.provider or "codex").strip().lower()
         if config.provider not in {"codex", "gemini"}:
             raise ValueError("provider must be codex or gemini")
-        if not config.codex_path:
-            raise ValueError("codex_path is required")
-        if not config.gemini_path:
-            raise ValueError("gemini_path is required")
+        config.codex_path = discover_codex_path(config.codex_path) or "codex"
+        config.gemini_path = discover_gemini_path(config.gemini_path) or "gemini"
         if not config.project_path:
             raise ValueError("project_path is required")
         if config.read_source == "ui" and not config.target_chats:
