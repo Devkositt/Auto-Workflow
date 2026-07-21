@@ -55,6 +55,9 @@ def default_state() -> dict[str, Any]:
         "chat_contents": {},
         "discord_last_message_ids": {},
         "last_sent_messages": {},
+        "last_provider_run_at": None,
+        "provider_runs": [],
+        "recent_prompt_hashes": {},
         "initialized_chats": False,
         "last_match": None,
         "codex_running": False,
@@ -128,6 +131,33 @@ def discover_gemini_path(configured_value: str = "") -> str:
     return normalized
 
 
+def discover_cursor_path(configured_value: str = "") -> str:
+    normalized = normalize_cli_command(configured_value)
+    candidate_names = [normalized, "cursor-agent", "agent", "cursor"]
+    candidate_names = [candidate for candidate in candidate_names if candidate]
+    for candidate in candidate_names:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
+            return str(candidate_path)
+    fallback_paths = [
+        Path.home() / ".local/share/cursor-agent/versions",
+        Path("/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
+    ]
+    versions_dir = fallback_paths[0]
+    if versions_dir.is_dir():
+        version_bins = sorted(versions_dir.glob("*/cursor-agent"), reverse=True)
+        for candidate in version_bins:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    app_bin = fallback_paths[1]
+    if app_bin.is_file() and os.access(app_bin, os.X_OK):
+        return str(app_bin)
+    return normalized
+
+
 @dataclass
 class AutomationConfig:
     project_path: str = "/Users/mac/Desktop/waansaung/delivery-app-backend"
@@ -159,11 +189,19 @@ class AutomationConfig:
     discord_prompt_channel_id: str = ""
     discord_api_host: str = "https://discord.com/api/v10"
     discord_read_limit: int = 25
+    discord_latest_message_only: bool = True
+    codex_timeout_seconds: int = 600
     stop_hotkey: str = "control+option+s"
     provider: str = "codex"
+    cursor_path: str = "cursor-agent"
+    cursor_model: str = ""
     gemini_path: str = "gemini"
     gemini_model: str = "gemini-3.5-flash"
     auto_switch_to_gemini_on_codex_limit: bool = True
+    min_run_interval_seconds: int = 1200
+    max_runs_per_day: int = 6
+    prompt_dedup_window_seconds: int = 43200
+    max_prompt_chars: int = 3500
     codex_prompt_prefix: str = (
         "Review these Lark messages and do only the backend/API/logic work requested. "
         "Keep the change scoped and run relevant checks. "
@@ -238,6 +276,7 @@ def load_config() -> AutomationConfig:
     if not CONFIG_PATH.exists():
         config = AutomationConfig()
         config.codex_path = discover_codex_path(config.codex_path) or "codex"
+        config.cursor_path = discover_cursor_path(config.cursor_path) or "cursor-agent"
         config.gemini_path = discover_gemini_path(config.gemini_path) or "gemini"
         save_config(config)
         return config
@@ -256,6 +295,7 @@ def load_config() -> AutomationConfig:
     defaults.update(raw)
     config = AutomationConfig(**defaults)
     config.codex_path = discover_codex_path(config.codex_path) or "codex"
+    config.cursor_path = discover_cursor_path(config.cursor_path) or "cursor-agent"
     config.gemini_path = discover_gemini_path(config.gemini_path) or "gemini"
     return config
 
@@ -320,6 +360,60 @@ class LarkAutomation:
         sent_map[destination_id] = {"hash": digest, "at": now}
         self.state.set("last_sent_messages", sent_map)
         return False
+
+    def should_skip_provider_run(self, trigger_text: str) -> tuple[bool, str]:
+        now = time.time()
+        snapshot = self.state.snapshot()
+
+        normalized = "\n".join(line.strip() for line in trigger_text.splitlines() if line.strip()).strip()
+        if not normalized:
+            return True, "empty_prompt"
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+        dedup_window = max(300, int(self.config.prompt_dedup_window_seconds))
+        recent_hashes = {
+            key: float(value)
+            for key, value in dict(snapshot.get("recent_prompt_hashes", {})).items()
+            if now - float(value) <= dedup_window
+        }
+        if digest in recent_hashes:
+            return True, f"duplicate_within_{dedup_window}s"
+
+        min_interval = max(0, int(self.config.min_run_interval_seconds))
+        last_run_at = snapshot.get("last_provider_run_at")
+        if min_interval > 0 and last_run_at:
+            try:
+                last_run_ts = datetime.fromisoformat(str(last_run_at)).timestamp()
+            except ValueError:
+                last_run_ts = 0
+            if last_run_ts and now - last_run_ts < min_interval:
+                return True, f"cooldown_{min_interval}s"
+
+        run_window_seconds = 86400
+        max_runs = max(1, int(self.config.max_runs_per_day))
+        recent_runs = [
+            str(item)
+            for item in list(snapshot.get("provider_runs", []))
+            if item
+            and (
+                now - datetime.fromisoformat(str(item)).timestamp() <= run_window_seconds
+                if "T" in str(item)
+                else False
+            )
+        ]
+        if len(recent_runs) >= max_runs:
+            return True, f"daily_limit_{max_runs}"
+
+        recent_hashes[digest] = now
+        recent_runs.append(datetime.now().isoformat(timespec="seconds"))
+        self.state.update(
+            {
+                "recent_prompt_hashes": recent_hashes,
+                "provider_runs": recent_runs[-100:],
+                "last_provider_run_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        return False, ""
 
     def request_cancel(self, reason: str) -> None:
         snapshot = self.state.snapshot()
@@ -466,6 +560,10 @@ class LarkAutomation:
                 else:
                     self.logs.add(f"Matched keywords: {', '.join(matched_keywords)}", "warn")
                 trigger_text = self.build_trigger_text(changed_text, matched_keywords)
+                skip_run, skip_reason = self.should_skip_provider_run(trigger_text)
+                if skip_run:
+                    self.logs.add(f"Provider run skipped to control usage: {skip_reason}.", "warn")
+                    return {"matched": False, "reason": skip_reason}
                 self.state.set(
                     "last_match",
                     {
@@ -539,7 +637,12 @@ class LarkAutomation:
 
         if not filtered:
             filtered = lines[-8:]
-        return "\n".join(filtered[:16])
+        text = "\n".join(filtered[:16])
+        max_chars = max(500, int(self.config.max_prompt_chars))
+        if len(text) > max_chars:
+            self.logs.add(f"Prompt truncated to {max_chars} chars to reduce usage.", "warn")
+            text = text[:max_chars].rstrip() + "\n...[truncated]"
+        return text
 
     def detect_local_git_command(self, tasks_text: str) -> list[str] | None:
         normalized_lines = [line.strip() for line in tasks_text.splitlines() if line.strip()]
@@ -696,16 +799,18 @@ class LarkAutomation:
             self.state.set("last_evening_dry_run_date", datetime.now().date().isoformat())
             return
 
-        self.logs.add("Generating evening report with Codex.")
-        codex_completed, report_output, _ = self.run_codex_prompt(
+        self.logs.add("Generating evening report with provider chain.")
+        report_completed, report_output, _, report_provider = self.run_provider_chain(
             prompt,
             cwd=self.config.project_path,
+            preferred_provider=self.config.provider,
             post_summary=False,
         )
-        if not codex_completed:
+        if not report_completed:
             report_text = "Today Tasks\n- Evening report ထုတ်ရာမှာ Codex run မအောင်မြင်ပါ။"
         else:
             report_text = self.extract_evening_report_text(report_output)
+            self.logs.add(f"Evening report generated by {report_provider}.")
         evening_chat_id = self.config.evening_report_chat_id.strip()
         if not evening_chat_id:
             self.logs.add("Evening report destination is empty; skipping evening report post.", "error")
@@ -972,6 +1077,8 @@ class LarkAutomation:
             if text:
                 texts.append(f"{author_name}\n{text}")
 
+        if self.config.discord_latest_message_only and texts:
+            texts = [texts[-1]]
         combined = self.clean_discord_text("\n\n".join(texts))
         self.logs.add(
             f"Discord read {len(response)} messages / {len(combined)} chars from channel {channel_id} "
@@ -1353,8 +1460,80 @@ class LarkAutomation:
     def resolve_codex_path(self) -> str:
         return discover_codex_path(self.config.codex_path)
 
+    def resolve_cursor_path(self) -> str:
+        return discover_cursor_path(self.config.cursor_path)
+
     def resolve_gemini_path(self) -> str:
         return discover_gemini_path(self.config.gemini_path)
+
+    def build_cursor_history_context(self, cwd: str, limit: int = 8) -> str:
+        result = subprocess.run(
+            ["git", "log", "--oneline", f"-n{limit}"],
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return ""
+        history = result.stdout.strip()
+        if not history:
+            return ""
+        return f"\n\nRecent git commit history:\n{history}"
+
+    def run_provider(self, provider: str, prompt: str, cwd: str, post_summary: bool = True) -> tuple[bool, str, str]:
+        provider_name = (provider or "codex").strip().lower()
+        if provider_name == "cursor":
+            return self.run_cursor_prompt(prompt, cwd=cwd, post_summary=post_summary)
+        if provider_name == "gemini":
+            return self.run_gemini_prompt(prompt, cwd=cwd, post_summary=post_summary)
+        return self.run_codex_prompt(prompt, cwd=cwd, post_summary=post_summary)
+
+    def run_provider_chain(
+        self,
+        prompt: str,
+        cwd: str,
+        *,
+        preferred_provider: str,
+        post_summary: bool = True,
+    ) -> tuple[bool, str, str, str]:
+        provider = (preferred_provider or "codex").strip().lower()
+        order_map = {
+            "codex": ["codex", "cursor", "gemini"],
+            "cursor": ["cursor", "gemini", "codex"],
+            "gemini": ["gemini", "cursor", "codex"],
+        }
+        providers = order_map.get(provider, ["codex", "cursor", "gemini"])
+        final_output = ""
+        final_status = "failed"
+        final_provider = providers[0]
+
+        for index, candidate in enumerate(providers):
+            self.logs.add(f"Trying provider: {candidate}.")
+            run_prompt = prompt
+            if candidate == "cursor":
+                run_prompt += self.build_cursor_history_context(cwd)
+            completed, output, status = self.run_provider(
+                candidate,
+                run_prompt,
+                cwd=cwd,
+                post_summary=False,
+            )
+            final_output = output
+            final_status = status
+            final_provider = candidate
+            if completed:
+                summary = str(self.state.snapshot().get("codex_result_summary") or "").strip()
+                if post_summary and summary:
+                    self.send_codex_result_summary(summary)
+                return True, output, status, candidate
+            if index < len(providers) - 1:
+                self.logs.add(f"{candidate} run did not complete successfully ({status}). Falling back.", "warn")
+
+        summary = str(self.state.snapshot().get("codex_result_summary") or "").strip()
+        if post_summary and summary:
+            self.send_codex_result_summary(summary)
+        return False, final_output, final_status, final_provider
 
     def execute_codex_and_maybe_push(self, tasks_text: str) -> None:
         project_path = Path(self.config.project_path).expanduser()
@@ -1411,35 +1590,19 @@ class LarkAutomation:
         self.logs.add(f"Codex triggered by text:\n---\n{tasks_text}\n---")
         self.focus_web_app()
         provider = self.config.provider.strip() or "codex"
-        if provider == "gemini":
-            completed, _, status = self.run_gemini_prompt(prompt, cwd=str(project_path))
-        else:
-            completed, output, status = self.run_codex_prompt(
-                prompt,
-                cwd=str(project_path),
-                post_summary=not self.config.auto_switch_to_gemini_on_codex_limit,
-            )
-            if status == "usage_limit" and self.config.auto_switch_to_gemini_on_codex_limit:
-                self.logs.add("Codex usage limit reached. Switching to Gemini CLI automatically.", "warn")
-                completed, _, status = self.run_gemini_prompt(prompt, cwd=str(project_path))
-            else:
-                _ = output
-
-        if (
-            provider != "gemini"
-            and self.config.auto_switch_to_gemini_on_codex_limit
-            and status != "usage_limit"
-        ):
-            final_summary = str(self.state.snapshot().get("codex_result_summary") or "").strip()
-            if final_summary:
-                self.send_codex_result_summary(final_summary)
+        completed, _, status, used_provider = self.run_provider_chain(
+            prompt,
+            cwd=str(project_path),
+            preferred_provider=provider,
+            post_summary=True,
+        )
 
         if self.config.auto_push and completed:
             self.commit_and_push(str(project_path))
         elif self.config.auto_push:
             self.logs.add("Auto-push skipped because provider run did not complete successfully.", "warn")
         else:
-            self.logs.add("Auto-push is disabled; leaving Codex changes for review.")
+            self.logs.add(f"Auto-push is disabled; leaving {used_provider} changes for review.")
         if self.config.read_source == "ui" or self.config.send_source == "ui":
             self.focus_lark_app()
 
@@ -1510,7 +1673,7 @@ class LarkAutomation:
             return False, "", "cli_not_found"
 
         self.logs.add("Running Codex CLI.")
-        timeout_seconds = 600
+        timeout_seconds = max(60, int(self.config.codex_timeout_seconds))
         started_at = time.time()
         self.state.update(
                 {
@@ -1717,6 +1880,104 @@ class LarkAutomation:
                 reason = "quota_exceeded"
             else:
                 status = f"Gemini failed ({completed.returncode})"
+                result_summary = self.extract_codex_result_summary(output)
+                reason = "failed"
+            success = False
+            self.logs.add(status + ".", "error")
+        self.state.update(
+            {
+                "codex_running": False,
+                "codex_last_status": status,
+                "codex_last_finished_at": datetime.now().isoformat(timespec="seconds"),
+                "codex_result_summary": result_summary,
+                "codex_output": [line for line in self.state.snapshot().get("codex_output", []) + ([output] if output else [])][-400:],
+            }
+        )
+        if post_summary and result_summary.strip():
+            self.send_codex_result_summary(result_summary)
+        if output:
+            self.logs.add(output[-1000:])
+        return success, output, reason
+
+    def run_cursor_prompt(self, prompt: str, cwd: str, post_summary: bool = True) -> tuple[bool, str, str]:
+        cursor_executable = self.config.cursor_path
+        cursor_path = self.resolve_cursor_path()
+        cursor_model = (self.config.cursor_model or "").strip()
+        if not cursor_path:
+            summary = "Cursor Agent CLI command မတွေ့လို့ fallback run မလုပ်နိုင်ပါ။"
+            self.logs.add("Cursor Agent CLI was not found on PATH.", "error")
+            self.state.update(
+                {
+                    "codex_running": False,
+                    "codex_project_path": cwd,
+                    "codex_last_status": "Cursor CLI not found",
+                    "codex_last_finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "codex_result_summary": summary,
+                }
+            )
+            if post_summary:
+                self.send_codex_result_summary(summary)
+            return False, "", "cli_not_found"
+
+        self.logs.add("Running Cursor Agent CLI.")
+        command_preview = [cursor_path]
+        if Path(cursor_path).name != "cursor-agent":
+            command_preview.append("agent")
+        command_preview.extend(["--print", "--output-format", "text", "--force", "--trust", "--workspace", cwd])
+        if cursor_model:
+            command_preview.extend(["--model", cursor_model])
+        command_preview.append("<prompt>")
+        self.state.update(
+            {
+                "codex_running": True,
+                "codex_started_at": datetime.now().isoformat(timespec="seconds"),
+                "codex_project_path": cwd,
+                "codex_last_status": "Running Cursor",
+                "codex_last_finished_at": None,
+                "codex_result_summary": None,
+                "codex_output": [
+                    "$ " + " ".join(command_preview),
+                    "\n[PROMPT]",
+                    prompt,
+                ],
+            }
+        )
+
+        command = [cursor_path]
+        if Path(cursor_path).name != "cursor-agent":
+            command.append("agent")
+        command.extend(["--print", "--output-format", "text", "--force", "--trust", "--workspace", cwd])
+        if cursor_model:
+            command.extend(["--model", cursor_model])
+        command.append(prompt)
+
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "TERM": "xterm-256color"},
+        )
+        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part).strip()
+        if completed.returncode == 0:
+            status = "Cursor Completed"
+            result_summary = self.extract_codex_result_summary(output)
+            success = True
+            reason = "completed"
+            self.logs.add("Cursor Agent CLI completed.")
+        else:
+            lowered = output.lower()
+            if "not authenticated" in lowered or "login" in lowered:
+                status = "Cursor authentication required"
+                result_summary = "Cursor Agent CLI login မဝင်ရသေးလို့ run မလုပ်နိုင်ပါ။"
+                reason = "auth_required"
+            elif "rate limit" in lowered or "usage limit" in lowered:
+                status = "Cursor usage limit reached"
+                result_summary = "Cursor usage limit ပြည့်နေပါတယ်။"
+                reason = "usage_limit"
+            else:
+                status = f"Cursor failed ({completed.returncode})"
                 result_summary = self.extract_codex_result_summary(output)
                 reason = "failed"
             success = False
@@ -2419,6 +2680,10 @@ HTML = r"""<!doctype html>
               <input id="scanInterval" type="number" min="30" step="30">
             </div>
             <div class="field">
+              <label for="codexTimeout">Codex timeout seconds</label>
+              <input id="codexTimeout" type="number" min="60" step="60">
+            </div>
+            <div class="field">
               <label for="readSource">Read source</label>
               <input id="readSource" placeholder="ui">
             </div>
@@ -2445,6 +2710,14 @@ HTML = r"""<!doctype html>
             <div class="field">
               <label for="provider">Default provider</label>
               <input id="provider" placeholder="codex">
+            </div>
+            <div class="field wide">
+              <label for="cursorPath">Cursor path or command</label>
+              <input id="cursorPath" placeholder="cursor-agent">
+            </div>
+            <div class="field">
+              <label for="cursorModel">Cursor model</label>
+              <input id="cursorModel" placeholder="optional">
             </div>
             <div class="field wide">
               <label for="geminiPath">Gemini path or command</label>
@@ -2483,6 +2756,22 @@ HTML = r"""<!doctype html>
               <label for="discordReadLimit">Discord read limit</label>
               <input id="discordReadLimit" type="number" min="1" max="100" step="1">
             </div>
+            <div class="field">
+              <label for="minRunInterval">Min run interval seconds</label>
+              <input id="minRunInterval" type="number" min="0" step="60">
+            </div>
+            <div class="field">
+              <label for="maxRunsPerDay">Max runs per day</label>
+              <input id="maxRunsPerDay" type="number" min="1" step="1">
+            </div>
+            <div class="field">
+              <label for="promptDedupWindow">Prompt dedup window seconds</label>
+              <input id="promptDedupWindow" type="number" min="300" step="300">
+            </div>
+            <div class="field">
+              <label for="maxPromptChars">Max prompt chars</label>
+              <input id="maxPromptChars" type="number" min="500" step="100">
+            </div>
             <div class="field wide">
               <label for="morningMessage">Morning message</label>
               <textarea id="morningMessage"></textarea>
@@ -2505,6 +2794,7 @@ HTML = r"""<!doctype html>
             <label class="check"><input id="autoPush" type="checkbox"> Auto push</label>
             <label class="check"><input id="ignoreFirstScan" type="checkbox"> Ignore first scan</label>
             <label class="check"><input id="autoSwitchGemini" type="checkbox"> Auto switch to Gemini on Codex limit</label>
+            <label class="check"><input id="discordLatestOnly" type="checkbox"> Discord latest message only</label>
           </div>
         </div>
       </section>
@@ -2556,6 +2846,7 @@ HTML = r"""<!doctype html>
       $("morningTime").value = config.morning_report_time;
       $("eveningTime").value = config.evening_report_time;
       $("scanInterval").value = config.scan_interval_seconds;
+      $("codexTimeout").value = config.codex_timeout_seconds || 600;
       $("readSource").value = config.read_source;
       $("sendSource").value = config.send_source;
       $("apiPageSize").value = config.lark_api_page_size;
@@ -2563,6 +2854,8 @@ HTML = r"""<!doctype html>
       $("applinkHost").value = config.lark_applink_host;
       $("codexPath").value = config.codex_path;
       $("provider").value = config.provider || "codex";
+      $("cursorPath").value = config.cursor_path || "cursor-agent";
+      $("cursorModel").value = config.cursor_model || "";
       $("geminiPath").value = config.gemini_path || "gemini";
       $("geminiModel").value = config.gemini_model || "gemini-3.5-flash";
       $("stopHotkey").value = config.stop_hotkey;
@@ -2572,6 +2865,10 @@ HTML = r"""<!doctype html>
       $("discordPromptChannelId").value = config.discord_prompt_channel_id || "";
       $("discordApiHost").value = config.discord_api_host || "https://discord.com/api/v10";
       $("discordReadLimit").value = config.discord_read_limit || 25;
+      $("minRunInterval").value = config.min_run_interval_seconds || 1200;
+      $("maxRunsPerDay").value = config.max_runs_per_day || 6;
+      $("promptDedupWindow").value = config.prompt_dedup_window_seconds || 43200;
+      $("maxPromptChars").value = config.max_prompt_chars || 3500;
       $("morningMessage").value = config.morning_message;
       $("keywords").value = config.keywords.join("\n");
       $("dmTargetId").value = config.dm_target_id;
@@ -2580,6 +2877,7 @@ HTML = r"""<!doctype html>
       $("autoPush").checked = config.auto_push;
       $("ignoreFirstScan").checked = config.ignore_first_scan;
       $("autoSwitchGemini").checked = config.auto_switch_to_gemini_on_codex_limit !== false;
+      $("discordLatestOnly").checked = config.discord_latest_message_only !== false;
       toggleTargetFields(config.read_source);
     }
 
@@ -2603,6 +2901,7 @@ HTML = r"""<!doctype html>
         morning_report_time: $("morningTime").value.trim(),
         evening_report_time: $("eveningTime").value.trim(),
         scan_interval_seconds: Number($("scanInterval").value || 300),
+        codex_timeout_seconds: Number($("codexTimeout").value || 600),
         read_source: $("readSource").value.trim() || "ui",
         send_source: $("sendSource").value.trim() || "ui",
         lark_api_page_size: Number($("apiPageSize").value || 20),
@@ -2610,6 +2909,8 @@ HTML = r"""<!doctype html>
         lark_applink_host: $("applinkHost").value.trim() || "https://applink.larksuite.com",
         codex_path: $("codexPath").value.trim() || "codex",
         provider: $("provider").value.trim() || "codex",
+        cursor_path: $("cursorPath").value.trim() || "cursor-agent",
+        cursor_model: $("cursorModel").value.trim(),
         gemini_path: $("geminiPath").value.trim() || "gemini",
         gemini_model: $("geminiModel").value.trim() || "gemini-3.5-flash",
         stop_hotkey: $("stopHotkey").value.trim() || "control+option+s",
@@ -2619,6 +2920,10 @@ HTML = r"""<!doctype html>
         discord_prompt_channel_id: $("discordPromptChannelId").value.trim(),
         discord_api_host: $("discordApiHost").value.trim() || "https://discord.com/api/v10",
         discord_read_limit: Number($("discordReadLimit").value || 25),
+        min_run_interval_seconds: Number($("minRunInterval").value || 1200),
+        max_runs_per_day: Number($("maxRunsPerDay").value || 6),
+        prompt_dedup_window_seconds: Number($("promptDedupWindow").value || 43200),
+        max_prompt_chars: Number($("maxPromptChars").value || 3500),
         morning_message: $("morningMessage").value,
         keywords: lines($("keywords").value),
         dm_target_id: $("dmTargetId").value.trim(),
@@ -2626,7 +2931,8 @@ HTML = r"""<!doctype html>
         dry_run: $("dryRun").checked,
         auto_push: $("autoPush").checked,
         ignore_first_scan: $("ignoreFirstScan").checked,
-        auto_switch_to_gemini_on_codex_limit: $("autoSwitchGemini").checked
+        auto_switch_to_gemini_on_codex_limit: $("autoSwitchGemini").checked,
+        discord_latest_message_only: $("discordLatestOnly").checked
       };
     }
 
@@ -2862,6 +3168,8 @@ class AppHandler(BaseHTTPRequestHandler):
         parse_hhmm(config.evening_report_time)
         if config.scan_interval_seconds < 30:
             raise ValueError("scan_interval_seconds must be at least 30")
+        if config.codex_timeout_seconds < 60:
+            raise ValueError("codex_timeout_seconds must be at least 60")
         if config.read_source not in {"ui", "api", "api_dm", "discord"}:
             raise ValueError("read_source must be ui, api, api_dm, or discord")
         if config.send_source not in {"ui", "discord"}:
@@ -2870,6 +3178,14 @@ class AppHandler(BaseHTTPRequestHandler):
             raise ValueError("lark_api_page_size must be between 1 and 50")
         if config.discord_read_limit < 1 or config.discord_read_limit > 100:
             raise ValueError("discord_read_limit must be between 1 and 100")
+        if config.min_run_interval_seconds < 0:
+            raise ValueError("min_run_interval_seconds must be 0 or more")
+        if config.max_runs_per_day < 1:
+            raise ValueError("max_runs_per_day must be at least 1")
+        if config.prompt_dedup_window_seconds < 300:
+            raise ValueError("prompt_dedup_window_seconds must be at least 300")
+        if config.max_prompt_chars < 500:
+            raise ValueError("max_prompt_chars must be at least 500")
         if not config.lark_api_host.startswith("https://"):
             raise ValueError("lark_api_host must start with https://")
         if not config.lark_applink_host.startswith("https://"):
@@ -2879,9 +3195,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if config.stop_hotkey != "control+option+s":
             raise ValueError("Only control+option+s is supported as stop_hotkey right now")
         config.provider = (config.provider or "codex").strip().lower()
-        if config.provider not in {"codex", "gemini"}:
-            raise ValueError("provider must be codex or gemini")
+        if config.provider not in {"codex", "cursor", "gemini"}:
+            raise ValueError("provider must be codex, cursor, or gemini")
         config.codex_path = discover_codex_path(config.codex_path) or "codex"
+        config.cursor_path = discover_cursor_path(config.cursor_path) or "cursor-agent"
         config.gemini_path = discover_gemini_path(config.gemini_path) or "gemini"
         if not config.project_path:
             raise ValueError("project_path is required")
